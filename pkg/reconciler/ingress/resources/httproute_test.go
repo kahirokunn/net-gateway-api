@@ -645,6 +645,86 @@ func TestMakeHTTPRoute(t *testing.T) {
 	}
 }
 
+func TestMakeHTTPRouteForDomainMappingTraffic(t *testing.T) {
+	tcs := &testConfigStore{config: testConfig}
+	ctx := tcs.ToContext(context.Background())
+	ing := &v1alpha1.Ingress{
+		ObjectMeta: metav1.ObjectMeta{Name: "app.example.com", Namespace: testNamespace},
+	}
+	rule := &v1alpha1.IngressRule{
+		Hosts:      []string{"app.example.com"},
+		Visibility: v1alpha1.IngressVisibilityExternalIP,
+		HTTP: &v1alpha1.HTTPIngressRuleValue{Paths: []v1alpha1.HTTPIngressPath{{
+			Splits: []v1alpha1.IngressBackendSplit{{
+				IngressBackend: v1alpha1.IngressBackend{
+					ServiceName:      "website-00001",
+					ServiceNamespace: testNamespace,
+					ServicePort:      intstr.FromInt(80),
+				},
+				Percent: 80,
+				AppendHeaders: map[string]string{
+					"K-Original-Host":           "app.example.com",
+					"Knative-Serving-Namespace": "test-ns",
+					"Knative-Serving-Revision":  "website-00001",
+				},
+			}, {
+				IngressBackend: v1alpha1.IngressBackend{
+					ServiceName:      "website-00002",
+					ServiceNamespace: testNamespace,
+					ServicePort:      intstr.FromInt(80),
+				},
+				Percent: 20,
+				AppendHeaders: map[string]string{
+					"K-Original-Host":           "app.example.com",
+					"Knative-Serving-Namespace": "test-ns",
+					"Knative-Serving-Revision":  "website-00002",
+				},
+			}},
+		}}},
+	}
+
+	route, err := MakeHTTPRoute(ctx, ing, rule)
+	if err != nil {
+		t.Fatal("MakeHTTPRoute failed:", err)
+	}
+	if got, want := len(route.Spec.Rules), 1; got != want {
+		t.Fatalf("rules = %d, want %d", got, want)
+	}
+	httpRule := route.Spec.Rules[0]
+	if got, want := len(httpRule.BackendRefs), 2; got != want {
+		t.Fatalf("backendRefs = %d, want %d", got, want)
+	}
+	for i, want := range []struct {
+		name   gatewayapi.ObjectName
+		weight int32
+	}{
+		{name: "website-00001", weight: 80},
+		{name: "website-00002", weight: 20},
+	} {
+		backend := httpRule.BackendRefs[i]
+		if backend.Name != want.name || backend.Weight == nil || *backend.Weight != want.weight {
+			t.Errorf("backend %d = %s/%v, want %s/%d", i, backend.Name, backend.Weight, want.name, want.weight)
+		}
+		gotHeaders := make(map[gatewayapi.HTTPHeaderName]string)
+		for _, filter := range backend.Filters {
+			if filter.RequestHeaderModifier != nil {
+				for _, h := range filter.RequestHeaderModifier.Set {
+					gotHeaders[h.Name] = h.Value
+				}
+			}
+		}
+		if got, want := gotHeaders["K-Original-Host"], "app.example.com"; got != want {
+			t.Errorf("backend %d original host = %q, want %q", i, got, want)
+		}
+	}
+
+	for _, filter := range httpRule.Filters {
+		if filter.URLRewrite != nil {
+			t.Error("direct Revision route unexpectedly contains a URLRewrite filter")
+		}
+	}
+}
+
 func TestAddEndpointProbes(t *testing.T) {
 	tcs := &testConfigStore{config: testConfig}
 	ctx := tcs.ToContext(context.Background())
